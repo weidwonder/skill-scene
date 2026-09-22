@@ -87,19 +87,23 @@ description: "<按上一节写>"
 
 ## 本场景的 skill
 
-| skill | 用途 |
-|-------|------|
-| [dw-workflow](../dw-workflow/SKILL.md) | 开发主流程：分流、spec、coding plan、测试方案 |
-| [dw-worktree](../dw-worktree/SKILL.md) | 任务开始前建 worktree，全部门禁通过后合并 |
+- **[dw-workflow](../dw-workflow/SKILL.md)**
+  <原 skill 的完整 description，压平换行后照搬>
+- **[dw-worktree](../dw-worktree/SKILL.md)**
+  <同上>
 
 按当前这一步的需要读取其中一两个，不要全部读入。
 
 ## 不在本场景的
 
-需要的能力不在上表里时：
+需要的能力不在上面的清单里时：
 
 - 只要那一个 skill 的内容，直接 `Read ~/.claude/skills/<skill-name>/SKILL.md`。
 - 整段工作要转到另一个领域，先读 `../skill-scene/SCENE-INDEX.md` 查它属于哪个场景，再进那个场景。
 ```
 
-表格第二列写**用途**，不要抄原 skill 的 description。原 description 是为了让模型在上百个候选里做匹配而写的，进了场景已经不需要那些触发词；这里要的是"选它还是选隔壁那个"的区分度，一句话即可。
+清单**照搬 skill 的完整 description，不要截断**。场景正文不进启动上下文，进入场景后才加载，在这里省字数省不到任何地方，却会让「该读哪个 skill」失去判据。
+
+用列表而不是表格：description 里只要出现一个 `|`，表格就会被撑坏。
+
+这份清单由 `scene-tool.ts` 从各 skill 的 frontmatter 自动生成，不要手写——手写的那份迟早和原件对不上。

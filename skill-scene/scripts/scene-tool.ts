@@ -235,14 +235,12 @@ function approxTokens(chars: number): number {
   return Math.round(chars / 3);
 }
 
-/** 从 description 取第一句作为场景表格里的用途说明。 */
-function firstClause(description: string): string {
-  const first = description.split("。")[0].split(". ")[0].trim();
-  if (first.length <= 60) return first;
-  // 中文第一句常常很长，硬切会断在词中间；退到最后一个标点处断开。
-  const head = first.slice(0, 60);
-  const cut = Math.max(head.lastIndexOf("、"), head.lastIndexOf("，"), head.lastIndexOf(" "));
-  return (cut > 20 ? head.slice(0, cut) : head) + "…";
+/** 场景正文里照搬 skill 的完整 description。
+ *
+ *  场景正文不进启动上下文，进入场景后才加载，所以这里省字数省不到任何地方，
+ *  反而会让「该读哪个 skill」失去判断依据。只压平换行，不截断。 */
+function fullDescription(description: string): string {
+  return description.replace(/\s+/g, " ").trim();
 }
 
 /** 本 skill 自己不参与归集，但它的 description 照常注入，统计时不能漏。 */
@@ -488,7 +486,7 @@ function cmdApply(root: string, opts: ApplyOptions): number {
 
 function renderScene(scene: SceneSpec, byName: Map<string, Skill>): string {
   const rows = scene.skills
-    .map((n) => `| [${n}](../${n}/SKILL.md) | ${firstClause(byName.get(n)!.description)} |`)
+    .map((n) => `- **[${n}](../${n}/SKILL.md)**\n  ${fullDescription(byName.get(n)!.description)}`)
     .join("\n");
 
   return `---
@@ -500,15 +498,13 @@ description: "${scene.description}"
 
 ## 本场景的 skill
 
-| skill | 用途 |
-|-------|------|
 ${rows}
 
 按当前这一步的需要读取其中一两个，不要全部读入。
 
 ## 不在本场景的
 
-需要的能力不在上表里时：
+需要的能力不在上面的清单里时：
 
 - 只要那一个 skill 的内容，直接 \`Read\` 它的 \`SKILL.md\`，路径是 skills 根目录下的同名目录。
 - 整段工作要转到另一个领域，先读 \`../${SELF_NAME}/${INDEX_FILENAME}\` 查它属于哪个场景，再进那个场景。
