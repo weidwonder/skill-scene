@@ -16,7 +16,7 @@ const STATE_FILENAME = ".skill-scene-state.json";
 const INDEX_FILENAME = "SCENE-INDEX.md";
 const SELF_NAME = "skill-scene";
 const SCENE_PREFIX = "scene-";
-const STATE_VERSION = 1;
+const STATE_VERSION = 2;
 
 /** 这些目录不是普通 skill，归集时一律跳过。
  *  synced 由 claude.ai 同步机制管理，带自己的 manifest，改动会被覆盖。 */
@@ -36,20 +36,39 @@ type Plan = {
   unassigned?: UnassignedSpec[];
 };
 
-type MarkRecord = { name: string; had_field: boolean };
-
 type State = {
   version: number;
   applied_at: string;
   skills_root: string;
   scenes: string[];
-  marked: MarkRecord[];
+  /** 本工具打标的 skill。它们一定原本没有该字段，restore 时全部摘掉。 */
+  marked: string[];
+  /** 方案把它们收进了场景，但它们自带该字段：只在场景清单里露面，文件一个字不改。 */
+  self_disabled: string[];
+  /** 显式声明不归集的：完全不碰，照常参与自动路由。 */
+  untouched: string[];
   skipped_symlinks: string[];
   index?: string;
   /** 完整方案随状态一起存档：归类决策是唯一的人工输入，
    *  外部那份 scenes.json 丢了也不必重做。 */
   plan: Plan;
 };
+
+/** v1 的 marked 是 {name, had_field} 数组，restore 仍要认得它。 */
+type LegacyMark = { name: string; had_field: boolean };
+
+/** 从两代 marked 结构里取出该摘标的名字。
+ *  v2 全部由本工具所打，一律摘；v1 里 had_field 为真的是 skill 自带的，留着。 */
+function marksToUnmark(marked: (string | LegacyMark)[]): string[] {
+  return marked
+    .filter((m) => typeof m === "string" || !m.had_field)
+    .map((m) => (typeof m === "string" ? m : m.name));
+}
+
+/** 从两代 marked 结构里取出全部名字。 */
+function markNames(marked: (string | LegacyMark)[]): string[] {
+  return marked.map((m) => (typeof m === "string" ? m : m.name));
+}
 
 /** 带可操作信息的失败。错误文本要让调用者据以自改，不要只说失败。 */
 class ToolError extends Error {}
@@ -383,10 +402,13 @@ function cmdApply(root: string, opts: ApplyOptions): number {
     );
   }
 
-  const excluded = (plan.unassigned ?? []).map(unassignedName).filter((n) => byName.has(n));
-  const targets = new Set([...planned, ...excluded]);
+  // unassigned 是「看过、决定不归集」的显式记录：一个字都不改，照常参与自动路由。
+  // 藏起一个没有场景能带出它的 skill，等于废掉它。
+  const untouched = (plan.unassigned ?? []).map(unassignedName).filter((n) => byName.has(n));
+  const declared = new Set([...planned, ...untouched]);
+  const targets = new Set(planned);
 
-  const unplanned = [...byName.keys()].filter((n) => !targets.has(n)).sort();
+  const unplanned = [...byName.keys()].filter((n) => !declared.has(n)).sort();
   if (unplanned.length && !opts.allowUnplanned) {
     throw new ToolError(
       `这 ${unplanned.length} 个 skill 既不在任何场景里，也不在 unassigned 清单里:\n  ` +
@@ -407,30 +429,40 @@ function cmdApply(root: string, opts: ApplyOptions): number {
     skipped.sort();
   }
 
-  // 提前校验索引落点，避免建完场景才发现无处可写。
-  const index = indexPath(root);
-
-  if (opts.dryRun) {
-    console.log(`[dry-run] 将建立 ${plan.scenes.length} 个场景入口`);
-    console.log(`[dry-run] 将打标 ${targets.size} 个 skill`);
-    if (skipped.length) console.log(`[dry-run] 跳过 ${skipped.length} 个软链 skill`);
-    if (unplanned.length) console.log(`[dry-run] 保持现状 ${unplanned.length} 个`);
-    return 0;
-  }
-
-  // 已归集过时沿用原有的 had_field 记录。重新探测会把上一轮自己打的标
-  // 误判成「skill 自带」，那样 restore 就再也摘不掉它了。
-  const prior = new Map<string, boolean>();
+  // 已归集过时先认出哪些标是本工具打的。没有这一步，上一轮自己打的标
+  // 会在这一轮被当成「skill 自带」而跳过，restore 就再也摘不掉它了。
+  const prior = new Set<string>();
   if (isFile(statePath(root))) {
     try {
-      const old: State = JSON.parse(fs.readFileSync(statePath(root), "utf8"));
-      for (const m of old.marked ?? []) prior.set(m.name, m.had_field);
+      const old = JSON.parse(fs.readFileSync(statePath(root), "utf8"));
+      for (const m of old.marked ?? []) prior.add(typeof m === "string" ? m : m.name);
     } catch (err) {
       throw new ToolError(
         `状态文件无法解析: ${statePath(root)}\n  ${(err as Error).message}\n` +
           `修好它或先 restore，不要在状态不明时重复 apply。`,
       );
     }
+  }
+
+  // 自带该字段的 skill 本就不参与自动路由，归集它没有意义：进场景清单即可，文件不动。
+  const selfDisabled = [...targets]
+    .filter((n) => !prior.has(n) && byName.get(n)!.marked)
+    .sort();
+  for (const n of selfDisabled) targets.delete(n);
+
+  // 提前校验索引落点，避免建完场景才发现无处可写。
+  const index = indexPath(root);
+
+  if (opts.dryRun) {
+    console.log(`[dry-run] 将建立 ${plan.scenes.length} 个场景入口`);
+    console.log(`[dry-run] 将打标 ${targets.size} 个 skill`);
+    if (selfDisabled.length) {
+      console.log(`[dry-run] 自带该字段、只进场景清单不改文件 ${selfDisabled.length} 个`);
+    }
+    console.log(`[dry-run] 声明不归集、保持原样 ${untouched.length} 个`);
+    if (skipped.length) console.log(`[dry-run] 跳过软链 ${skipped.length} 个`);
+    if (unplanned.length) console.log(`[dry-run] 未在方案中、保持原样 ${unplanned.length} 个`);
+    return 0;
   }
 
   // --- 写操作从这里开始 ---
@@ -440,6 +472,8 @@ function cmdApply(root: string, opts: ApplyOptions): number {
     skills_root: root,
     scenes: [],
     marked: [],
+    self_disabled: selfDisabled,
+    untouched,
     skipped_symlinks: skipped,
     plan,
   };
@@ -454,7 +488,6 @@ function cmdApply(root: string, opts: ApplyOptions): number {
 
   for (const name of [...targets].sort()) {
     const skill = byName.get(name)!;
-    const had = prior.has(name) ? prior.get(name)! : skill.marked;
     if (!skill.marked) {
       try {
         skill.write(addField(skill.text));
@@ -462,16 +495,21 @@ function cmdApply(root: string, opts: ApplyOptions): number {
         throw new ToolError(`${name}/SKILL.md 打标失败: ${(err as Error).message}`);
       }
     }
-    state.marked.push({ name, had_field: had });
+    state.marked.push(name);
   }
 
   fs.writeFileSync(index, renderIndex(plan), "utf8");
   state.index = path.relative(root, index);
   fs.writeFileSync(statePath(root), JSON.stringify(state, null, 2), "utf8");
 
-  const newly = state.marked.filter((m) => !m.had_field).length;
   console.log(`建立场景入口 ${state.scenes.length} 个`);
-  console.log(`打标 ${newly} 个（另有 ${state.marked.length - newly} 个本来就带该字段，已记录不动）`);
+  console.log(`打标 ${state.marked.length} 个（进场景且原本参与自动路由的）`);
+  if (selfDisabled.length) {
+    console.log(
+      `自带该字段、只进场景清单不改文件 ${selfDisabled.length} 个: ${selfDisabled.join(", ")}`,
+    );
+  }
+  console.log(`声明不归集、保持原样 ${untouched.length} 个`);
   if (skipped.length) {
     console.log(
       `跳过软链 ${skipped.length} 个: ${skipped.slice(0, 5).join(", ")}` +
@@ -536,22 +574,20 @@ function cmdRestore(root: string): number {
   }
 
   const state: State = JSON.parse(fs.readFileSync(sp, "utf8"));
-  if (state.version !== STATE_VERSION) {
-    throw new ToolError(`状态文件版本 ${state.version} 不被支持（本工具为 ${STATE_VERSION}）`);
+  if (state.version > STATE_VERSION) {
+    throw new ToolError(
+      `状态文件版本 ${state.version} 比本工具（${STATE_VERSION}）新，先升级 scene-tool.ts`,
+    );
   }
 
   const byName = new Map(collect(root).map((s) => [s.name, s]));
+  const toUnmark = marksToUnmark(state.marked ?? []);
   let unmarked = 0;
-  let kept = 0;
 
-  for (const item of state.marked ?? []) {
-    if (item.had_field) {
-      kept++;
-      continue;
-    }
-    const skill = byName.get(item.name);
+  for (const name of toUnmark) {
+    const skill = byName.get(name);
     if (!skill) {
-      console.log(`  跳过 ${item.name}：目录已不存在`);
+      console.log(`  跳过 ${name}：目录已不存在`);
       continue;
     }
     skill.write(dropField(skill.text));
@@ -572,7 +608,9 @@ function cmdRestore(root: string): number {
   fs.unlinkSync(sp);
 
   console.log(`摘除打标 ${unmarked} 个`);
-  console.log(`保留自带该字段的 ${kept} 个`);
+  if ((state.self_disabled ?? []).length) {
+    console.log(`原样保留自带该字段的 ${state.self_disabled.length} 个`);
+  }
   console.log(`删除场景入口 ${removed} 个，索引与状态文件已清除`);
   console.log("改动即时生效，不必重开会话。");
   return 0;
@@ -595,14 +633,17 @@ function cmdVerify(root: string): number {
     }
   }
 
-  for (const item of state.marked ?? []) {
-    const skill = byName.get(item.name);
-    if (!skill) problems.push(`已记录但目录不存在: ${item.name}`);
-    else if (!skill.marked) problems.push(`打标丢失（可能被升级覆盖）: ${item.name}`);
+  for (const name of markNames(state.marked ?? [])) {
+    const skill = byName.get(name);
+    if (!skill) problems.push(`已记录但目录不存在: ${name}`);
+    else if (!skill.marked) problems.push(`打标丢失（可能被升级覆盖）: ${name}`);
   }
 
+  // untouched 与 self_disabled 是「已知且刻意不动」的，不能被当成漏网的新 skill。
   const tracked = new Set<string>([
-    ...(state.marked ?? []).map((m) => m.name),
+    ...markNames(state.marked ?? []),
+    ...(state.self_disabled ?? []),
+    ...(state.untouched ?? []),
     ...(state.scenes ?? []),
   ]);
   const newcomers = [...byName.values()]

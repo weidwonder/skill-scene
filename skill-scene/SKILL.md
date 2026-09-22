@@ -15,7 +15,7 @@ description: "把过多的 skill 按场景归集：少数场景入口参与模�
 
 | 事实类别 | 它的家 | 什么时候读 |
 |---------|--------|-----------|
-| 机制约束、三条硬事实 | 本文件〈机制约束〉 | 触发即读 |
+| 机制约束、四条硬事实 | 本文件〈机制约束〉 | 触发即读 |
 | 日常在场景里找 skill、跨场景引用 | 本文件 A 节 | 触发即读 |
 | 场景怎么划、scene SKILL.md 怎么写 | [references/scene-authoring.md](references/scene-authoring.md) | 仅当要生成或调整场景划分时 |
 | 归集/还原的执行步骤与脚本用法 | [references/collation.md](references/collation.md) | 仅当要执行归集、还原或排查归集故障时 |
@@ -23,11 +23,12 @@ description: "把过多的 skill 按场景归集：少数场景入口参与模�
 
 ## 机制约束
 
-这三条决定了整套机制为什么这样设计，动手前必须知道：
+这四条决定了整套机制为什么这样设计，动手前必须知道：
 
 1. **「能被模型自动选中」和「description 常驻启动上下文」是同一件事。** description 存在的唯一目的就是给模型做匹配判断。所以让一个 skill 省下注入，代价必然是它失去被模型自动选中的资格，没有中间态。
 2. **`disable-model-invocation: true` 让 description 不进启动上下文，但 `/skill-name` 手工调用不受影响。** 这是本机制的支点：模型侧安静，用户侧照常。
-3. **skill 本体只有一份，场景只持有指向它的链接。** 场景目录里只有 `SKILL.md` 一个文件，正文用相对链接指向 `../<skill-name>/SKILL.md`。任何形式的复制都会制造第二份真相，ak 之类的工具升级后就会出现场景里是旧版、原位是新版。
+3. **打标与进场景必须绑定。** 打了标的 skill，模型能重新找到它的唯一途径就是某个场景的清单。所以只给进了场景的 skill 打标；没有场景收留的一律保持原样、继续参与自动路由。藏起一个没有入口能带出的 skill，等于废掉它。自带该字段的 skill 则不必归集——它本来就不在自动路由里。
+4. **skill 本体只有一份，场景只持有指向它的链接。** 场景目录里只有 `SKILL.md` 一个文件，正文用相对链接指向 `../<skill-name>/SKILL.md`。任何形式的复制都会制造第二份真相，ak 之类的工具升级后就会出现场景里是旧版、原位是新版。
 
 补充两条操作前提：
 
@@ -113,7 +114,7 @@ node <skill 根目录>/scripts/scene-tool.ts scan
 node <skill 根目录>/scripts/scene-tool.ts restore
 ```
 
-它按状态文件 `~/.claude/.skill-scene-state.json` 回滚：删掉 `scene-*` 目录与 `SCENE-INDEX.md`，并只摘掉本机制加过的 `disable-model-invocation`。
+它按状态文件 `~/.claude/.skill-scene-state.json` 回滚：删掉 `scene-*` 目录与 `SCENE-INDEX.md`，并摘掉本机制打过的 `disable-model-invocation`。自带该字段的、以及声明不归集的，从头到尾没被改过，还原时也不碰。
 
 **状态文件丢失时脚本会报错停下，不要猜着还原。** 有些 skill 本来就自带 `disable-model-invocation: true`（那是它自身调用契约的要求，例如正文依赖 `$ARGUMENTS` 的 skill），无差别删除会破坏它们的设计。处置见 [references/collation.md](references/collation.md)〈状态文件丢失〉。
 

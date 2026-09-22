@@ -63,21 +63,26 @@ node scene-tool.ts apply --plan scenes.json
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "applied_at": "2026-09-22T04:10:00+00:00",
   "skills_root": "/Users/x/.claude/skills",
   "scenes": ["scene-software-delivery"],
-  "marked": [
-    { "name": "dw-workflow", "had_field": false },
-    { "name": "ak-ask", "had_field": true }
-  ],
+  "marked": ["dw-workflow", "dw-worktree"],
+  "self_disabled": ["ak-ask"],
+  "untouched": ["ak-bro"],
   "skipped_symlinks": [],
   "index": "skill-scene/SCENE-INDEX.md",
   "plan": { "scenes": [], "unassigned": [] }
 }
 ```
 
-`had_field` 是还原的全部依据：`false` 表示字段是本工具加的，还原时删掉；`true` 表示 skill 本来就带，还原时保留不动。
+三份名单对应三种处置：
+
+- `marked` —— 本工具打的标，还原时全部摘掉。能进这份名单的一定原本没有该字段。
+- `self_disabled` —— 方案把它们收进了场景，但它们自带该字段。只在场景清单里露面，文件一个字没改，还原时也不动。
+- `untouched` —— 声明不归集的。从头到尾没碰过，列在这里只是让 `verify` 别把它们当成漏网的新 skill。
+
+v1 的 `marked` 是 `{name, had_field}` 数组，`restore` 仍认得，会按 `had_field` 区分该摘哪些。
 
 ## 三、还原
 
@@ -85,7 +90,7 @@ node scene-tool.ts apply --plan scenes.json
 node scene-tool.ts restore
 ```
 
-它做三件事：摘掉 `had_field: false` 那些 skill 的字段、删除所有场景入口目录与索引、删除状态文件。
+它做三件事：摘掉 `marked` 名单里所有 skill 的字段、删除所有场景入口目录与索引、删除状态文件。`self_disabled` 与 `untouched` 两份名单从头到尾没被改过，还原时自然也不碰。
 
 ## 四、故障处置
 
