@@ -328,10 +328,8 @@ function cmdScan(root: string, asJson: boolean): number {
     if (symlinked.length > 10) console.log(`  … 另有 ${symlinked.length - 10} 个`);
   }
 
-  if (unmarked.length > 25) {
-    console.log();
-    console.log(`未归集数量 ${unmarked.length} 已超过 25，值得做一次归集。`);
-  }
+  // 只报事实，不替使用者下「该归集了」的判断：该不该做取决于这份清单是否
+  // 已经在妨碍路由，不取决于任何一个数量阈值。
   return 0;
 }
 
