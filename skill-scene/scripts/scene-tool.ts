@@ -11,12 +11,25 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
 
+/** settings.json 的 per-skill 清单开关，取值 on / name-only / user-invocable-only / off。 */
+const SETTINGS_KEY = "skillOverrides";
+
+/** 本机制用的档位：清单里只留名字、去掉 description，Skill 工具调用照常。 */
+const OVERRIDE_VALUE = "name-only";
+
+/** 旧机制打在 frontmatter 上的字段。它连模型调用一起禁掉，且会锁死 settings 的
+ *  on/name-only 两档，已不再使用；只在迁移与冲突识别时出现。 */
 const FIELD = "disable-model-invocation";
+
+const SETTINGS_FILENAME = "settings.json";
+const LOCAL_SETTINGS_FILENAME = "settings.local.json";
 const STATE_FILENAME = ".skill-scene-state.json";
-const INDEX_FILENAME = "SCENE-INDEX.md";
+/** 旧版本生成过的反查索引。name-only 之后反查改用 grep，不再生成；
+ *  这里保留文件名只为清理上一轮留下的那份。 */
+const LEGACY_INDEX_FILENAME = "SCENE-INDEX.md";
 const SELF_NAME = "skill-scene";
 const SCENE_PREFIX = "scene-";
-const STATE_VERSION = 2;
+const STATE_VERSION = 3;
 
 /** 这些目录不是普通 skill，归集时一律跳过。
  *  synced 由 claude.ai 同步机制管理，带自己的 manifest，改动会被覆盖。 */
@@ -36,38 +49,44 @@ type Plan = {
   unassigned?: UnassignedSpec[];
 };
 
+/** 用户自己设过的 override：保留原值，记录来源文件。 */
+type PriorOverride = { name: string; value: string; source: string };
+
 type State = {
   version: number;
   applied_at: string;
   skills_root: string;
+  /** 写入 override 的 settings 文件。restore 从这里删。 */
+  settings_path: string;
+  override_value: string;
   scenes: string[];
-  /** 本工具打标的 skill。它们一定原本没有该字段，restore 时全部摘掉。 */
-  marked: string[];
-  /** 方案把它们收进了场景，但它们自带该字段：只在场景清单里露面，文件一个字不改。 */
+  /** 本工具写进 skillOverrides 的条目，restore 时逐个删掉。 */
+  overridden: string[];
+  /** frontmatter 自带 FIELD 的：模型调用被它禁掉，只在场景清单里露面，
+   *  settings 与文件都不动。 */
   self_disabled: string[];
+  /** 用户自己设过 override 的：原值保留，本工具不覆盖。 */
+  preexisting_overrides: PriorOverride[];
   /** 显式声明不归集的：完全不碰，照常参与自动路由。 */
   untouched: string[];
-  skipped_symlinks: string[];
+  /** 迁移时从 frontmatter 摘掉的旧打标。 */
+  unmarked_legacy: string[];
+  /** 旧版本写过的索引路径，只在清理时读。 */
   index?: string;
   /** 完整方案随状态一起存档：归类决策是唯一的人工输入，
    *  外部那份 scenes.json 丢了也不必重做。 */
   plan: Plan;
 };
 
-/** v1 的 marked 是 {name, had_field} 数组，restore 仍要认得它。 */
+/** v1 的 marked 是 {name, had_field} 数组，v2 是字符串数组。迁移与还原都要认得。 */
 type LegacyMark = { name: string; had_field: boolean };
 
-/** 从两代 marked 结构里取出该摘标的名字。
- *  v2 全部由本工具所打，一律摘；v1 里 had_field 为真的是 skill 自带的，留着。 */
-function marksToUnmark(marked: (string | LegacyMark)[]): string[] {
+/** 从两代 marked 结构里取出本工具打过标的名字。
+ *  v2 全部由本工具所打；v1 里 had_field 为真的是 skill 自带的，不算。 */
+function legacyMarkedByTool(marked: (string | LegacyMark)[]): string[] {
   return marked
     .filter((m) => typeof m === "string" || !m.had_field)
     .map((m) => (typeof m === "string" ? m : m.name));
-}
-
-/** 从两代 marked 结构里取出全部名字。 */
-function markNames(marked: (string | LegacyMark)[]): string[] {
-  return marked.map((m) => (typeof m === "string" ? m : m.name));
 }
 
 /** 带可操作信息的失败。错误文本要让调用者据以自改，不要只说失败。 */
@@ -117,21 +136,109 @@ function isFile(p: string): boolean {
   }
 }
 
-/** 状态文件放在 skills 根目录的父目录，这样删掉本 skill 也不会丢失还原依据。 */
-function statePath(skillsRoot: string): string {
-  return path.join(path.dirname(skillsRoot), STATE_FILENAME);
+/** 配置目录是 skills 根目录的父目录，settings 与状态文件都在这里。 */
+function configDir(skillsRoot: string): string {
+  return path.dirname(skillsRoot);
 }
 
-/** 索引跟着本 skill 走：agent 已经知道本 skill 的位置，查归属不必再记一个路径。 */
-function indexPath(skillsRoot: string): string {
-  const home = path.join(skillsRoot, SELF_NAME);
-  if (!isDir(home)) {
+/** 状态文件与 settings 同级，这样删掉本 skill 也不会丢失还原依据。 */
+function statePath(skillsRoot: string): string {
+  return path.join(configDir(skillsRoot), STATE_FILENAME);
+}
+
+/** 旧状态文件记着索引路径时给出它的绝对位置，用于清理。没有则返回 null。 */
+function legacyIndexPath(skillsRoot: string, state: State | null): string | null {
+  if (!state) return null;
+  return path.join(skillsRoot, state.index ?? path.join(SELF_NAME, LEGACY_INDEX_FILENAME));
+}
+
+function settingsPath(skillsRoot: string): string {
+  return path.join(configDir(skillsRoot), SETTINGS_FILENAME);
+}
+
+function localSettingsPath(skillsRoot: string): string {
+  return path.join(configDir(skillsRoot), LOCAL_SETTINGS_FILENAME);
+}
+
+// ---------------------------------------------------------------------------
+// settings
+// ---------------------------------------------------------------------------
+
+function readSettings(file: string): Record<string, unknown> {
+  if (!isFile(file)) return {};
+  const raw = fs.readFileSync(file, "utf8");
+  if (!raw.trim()) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("顶层不是 JSON 对象");
+    }
+    return parsed as Record<string, unknown>;
+  } catch (err) {
     throw new ToolError(
-      `未找到本 skill 的安装目录: ${home}\n` +
-        `索引要生成在它下面。先把 ${SELF_NAME} 安装到 skills 根目录，再执行。`,
+      `settings 文件无法解析: ${file}\n  ${(err as Error).message}\n` +
+        `先修好这个文件再执行，本工具不会覆盖无法解析的配置。`,
     );
   }
-  return path.join(home, INDEX_FILENAME);
+}
+
+function readOverrides(file: string): Record<string, string> {
+  const raw = readSettings(file)[SETTINGS_KEY];
+  if (raw === undefined) return {};
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new ToolError(
+      `${file} 里的 ${SETTINGS_KEY} 不是对象。它应当是「skill 名 -> 档位」的映射，` +
+        `档位取 on / ${OVERRIDE_VALUE} / user-invocable-only / off。`,
+    );
+  }
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof value !== "string") {
+      throw new ToolError(`${file} 里 ${SETTINGS_KEY}.${name} 的值不是字符串: ${String(value)}`);
+    }
+    out[name] = value;
+  }
+  return out;
+}
+
+/** 合并后的生效档位。settings.local.json 优先级高于 settings.json，
+ *  所以本地有条目时，写进 settings.json 的值不会生效。 */
+function effectiveOverrides(skillsRoot: string): Record<string, string> {
+  return {
+    ...readOverrides(settingsPath(skillsRoot)),
+    ...readOverrides(localSettingsPath(skillsRoot)),
+  };
+}
+
+/** 把条目写进 settings.json 的 skillOverrides，其余配置原样保留。 */
+function writeOverrides(file: string, entries: Map<string, string>): void {
+  const settings = readSettings(file);
+  const current = readOverrides(file);
+  for (const [name, value] of entries) current[name] = value;
+  settings[SETTINGS_KEY] = sortedRecord(current);
+  fs.writeFileSync(file, JSON.stringify(settings, null, 2) + "\n", "utf8");
+}
+
+/** 从 settings.json 删掉指定条目。删空后连 skillOverrides 键一起移除。 */
+function dropOverrides(file: string, names: string[]): number {
+  if (!isFile(file)) return 0;
+  const settings = readSettings(file);
+  const current = readOverrides(file);
+  let dropped = 0;
+  for (const name of names) {
+    if (name in current) {
+      delete current[name];
+      dropped++;
+    }
+  }
+  if (Object.keys(current).length === 0) delete settings[SETTINGS_KEY];
+  else settings[SETTINGS_KEY] = sortedRecord(current);
+  fs.writeFileSync(file, JSON.stringify(settings, null, 2) + "\n", "utf8");
+  return dropped;
+}
+
+function sortedRecord(record: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(Object.entries(record).sort(([a], [b]) => a.localeCompare(b)));
 }
 
 // ---------------------------------------------------------------------------
@@ -171,19 +278,6 @@ function readScalar(fm: string[], key: string): string {
   return "";
 }
 
-/** 插入字段。已存在则原样返回。插在 frontmatter 末尾，不动其他行。 */
-function addField(text: string): string {
-  const { lines: fm, bodyStart } = splitFrontmatter(text);
-  if (fm === null) {
-    throw new ToolError("没有合法的 YAML frontmatter（首行不是 --- 或缺少闭合的 ---）");
-  }
-  if (fieldLineIndex(fm) !== -1) return text;
-
-  const all = text.split("\n");
-  all.splice(bodyStart - 1, 0, `${FIELD}: true`); // 闭合的 --- 之前
-  return all.join("\n");
-}
-
 /** 删除字段所在行。不存在则原样返回。 */
 function dropField(text: string): string {
   const { lines: fm } = splitFrontmatter(text);
@@ -205,8 +299,6 @@ class Skill {
   readonly dir: string;
   readonly md: string;
   readonly isScene: boolean;
-  /** 软链指向 skills 根之外时，改它会波及共用该目录的其他 runtime。 */
-  readonly isSymlink: boolean;
   #text: string | null = null;
 
   constructor(dir: string) {
@@ -214,7 +306,6 @@ class Skill {
     this.name = path.basename(dir);
     this.md = path.join(dir, "SKILL.md");
     this.isScene = this.name.startsWith(SCENE_PREFIX);
-    this.isSymlink = fs.lstatSync(dir).isSymbolicLink();
   }
 
   get text(): string {
@@ -222,7 +313,8 @@ class Skill {
     return this.#text;
   }
 
-  get marked(): boolean {
+  /** frontmatter 里带 FIELD：模型调用被禁，且 settings 的 name-only 档被锁死。 */
+  get hasField(): boolean {
     const { lines } = splitFrontmatter(this.text);
     return lines !== null && fieldLineIndex(lines) !== -1;
   }
@@ -230,6 +322,12 @@ class Skill {
   get description(): string {
     const { lines } = splitFrontmatter(this.text);
     return lines ? readScalar(lines, "description") : "";
+  }
+
+  /** frontmatter 里声明的 name，斜杠调用用的是它（可能与目录名不同）。 */
+  get declaredName(): string {
+    const { lines } = splitFrontmatter(this.text);
+    return (lines ? readScalar(lines, "name") : "") || this.name;
   }
 
   write(text: string): void {
@@ -254,20 +352,30 @@ function approxTokens(chars: number): number {
   return Math.round(chars / 3);
 }
 
+/** description 是否还在启动清单里。两条退出路径都算：
+ *  settings 里有非 on 的档位，或 frontmatter 自带 FIELD。 */
+function isQuiet(skill: Skill, overrides: Record<string, string>): boolean {
+  const value = overrides[skill.name];
+  return (value !== undefined && value !== "on") || skill.hasField;
+}
+
 /** 场景正文里照搬 skill 的完整 description。
  *
  *  场景正文不进启动上下文，进入场景后才加载，所以这里省字数省不到任何地方，
- *  反而会让「该读哪个 skill」失去判断依据。只压平换行，不截断。 */
+ *  反而会让「该调哪个 skill」失去判断依据。只压平换行，不截断。 */
 function fullDescription(description: string): string {
   return description.replace(/\s+/g, " ").trim();
 }
 
 /** 本 skill 自己不参与归集，但它的 description 照常注入，统计时不能漏。 */
-function selfInjection(skillsRoot: string): { count: number; chars: number } {
+function selfInjection(
+  skillsRoot: string,
+  overrides: Record<string, string>,
+): { count: number; chars: number } {
   const dir = path.join(skillsRoot, SELF_NAME);
   if (!isFile(path.join(dir, "SKILL.md"))) return { count: 0, chars: 0 };
   const self = new Skill(dir);
-  if (self.marked) return { count: 0, chars: 0 };
+  if (isQuiet(self, overrides)) return { count: 0, chars: 0 };
   return { count: 1, chars: SELF_NAME.length + self.description.length };
 }
 
@@ -276,31 +384,40 @@ function selfInjection(skillsRoot: string): { count: number; chars: number } {
 // ---------------------------------------------------------------------------
 
 function cmdScan(root: string, asJson: boolean): number {
+  const overrides = effectiveOverrides(root);
   const skills = collect(root);
   const scenes = skills.filter((s) => s.isScene);
   const plain = skills.filter((s) => !s.isScene);
-  const marked = plain.filter((s) => s.marked);
-  const unmarked = plain.filter((s) => !s.marked);
-  const symlinked = unmarked.filter((s) => s.isSymlink);
+  const quiet = plain.filter((s) => isQuiet(s, overrides));
+  const loud = plain.filter((s) => !isQuiet(s, overrides));
+  const legacy = plain.filter((s) => s.hasField);
 
-  const self = selfInjection(root);
-  const injected = [...scenes, ...unmarked];
+  const self = selfInjection(root, overrides);
+  const injected = [...scenes, ...loud];
   const injectedCount = injected.length + self.count;
   const chars =
     injected.reduce((sum, s) => sum + s.name.length + s.description.length, 0) + self.chars;
+
+  // name-only 的 skill 在清单里只留一行名字，这份开销省不掉，要单独报出来。
+  const nameOnly = plain.filter((s) => overrides[s.name] === OVERRIDE_VALUE);
+  const nameOnlyChars = nameOnly.reduce((sum, s) => sum + s.name.length + 3, 0);
 
   if (asJson) {
     console.log(
       JSON.stringify(
         {
           skills_root: root,
+          settings: settingsPath(root),
           scenes: scenes.map((s) => s.name),
-          marked: marked.map((s) => s.name),
-          unmarked: unmarked.map((s) => s.name),
-          symlinked_unmarked: symlinked.map((s) => s.name),
+          quiet: quiet.map((s) => s.name),
+          loud: loud.map((s) => s.name),
+          frontmatter_field: legacy.map((s) => s.name),
           injected_count: injectedCount,
           injected_chars: chars,
           injected_tokens_approx: approxTokens(chars),
+          name_only_count: nameOnly.length,
+          name_only_chars: nameOnlyChars,
+          name_only_tokens_approx: approxTokens(nameOnlyChars),
         },
         null,
         2,
@@ -310,22 +427,31 @@ function cmdScan(root: string, asJson: boolean): number {
   }
 
   console.log(`skills 根目录: ${root}`);
+  console.log(`settings     : ${settingsPath(root)}`);
   console.log(`  场景入口     : ${scenes.length}`);
-  console.log(`  已退出注入   : ${marked.length}`);
-  console.log(`  仍在注入     : ${unmarked.length}`);
+  console.log(`  已退出注入   : ${quiet.length}`);
+  console.log(`  仍在注入     : ${loud.length}`);
   console.log();
   console.log(
     `当前启动注入 ${injectedCount} 份 description，约 ${chars} 字符 / ${approxTokens(chars)} tokens`,
   );
+  if (nameOnly.length) {
+    console.log(
+      `其中 ${nameOnly.length} 个 ${OVERRIDE_VALUE} 的 skill 只留名字，` +
+        `合计约 ${nameOnlyChars} 字符 / ${approxTokens(nameOnlyChars)} tokens`,
+    );
+  }
 
-  if (symlinked.length) {
+  if (legacy.length) {
     console.log();
-    console.log(`注意：${symlinked.length} 个仍在注入的 skill 是软链，指向 skills 根之外。`);
-    console.log("改动它们会波及共用该目录的其他工具（Cursor、Grok Build 读 ~/.agents/skills）。");
-    for (const s of symlinked.slice(0, 10)) {
-      console.log(`  ${s.name} -> ${fs.readlinkSync(s.dir)}`);
-    }
-    if (symlinked.length > 10) console.log(`  … 另有 ${symlinked.length - 10} 个`);
+    console.log(
+      `注意：${legacy.length} 个 skill 的 frontmatter 带 ${FIELD}，模型无法用 Skill 工具调用它们。`,
+    );
+    console.log(
+      `旧版本机制打的标属于这种情况，apply 会摘掉；skill 自带的会保留，只列进场景清单。`,
+    );
+    for (const s of legacy.slice(0, 10)) console.log(`  ${s.name}`);
+    if (legacy.length > 10) console.log(`  … 另有 ${legacy.length - 10} 个`);
   }
 
   // 只报事实，不替使用者下「该归集了」的判断：该不该做取决于这份清单是否
@@ -366,7 +492,7 @@ function loadPlan(planPath: string): Plan {
       if (prev) {
         throw new ToolError(
           `skill ${name} 同时出现在 ${SCENE_PREFIX}${prev} 和 ${SCENE_PREFIX}${scene.slug}。` +
-            `一个 skill 只能有一个主场景，跨场景引用靠 ${INDEX_FILENAME} 解决。`,
+            `一个 skill 只能有一个主场景，跨场景引用直接按名字调用，不靠重复登记。`,
         );
       }
       owner.set(name, scene.slug);
@@ -379,10 +505,30 @@ function unassignedName(item: UnassignedSpec): string {
   return typeof item === "string" ? item : item.name;
 }
 
+/** 读旧状态。版本不认识就停下，不在状态不明时重复 apply。 */
+function loadState(root: string): State | null {
+  const sp = statePath(root);
+  if (!isFile(sp)) return null;
+  let state: State;
+  try {
+    state = JSON.parse(fs.readFileSync(sp, "utf8"));
+  } catch (err) {
+    throw new ToolError(
+      `状态文件无法解析: ${sp}\n  ${(err as Error).message}\n` +
+        `修好它或先 restore，不要在状态不明时重复 apply。`,
+    );
+  }
+  if (state.version > STATE_VERSION) {
+    throw new ToolError(
+      `状态文件版本 ${state.version} 比本工具（${STATE_VERSION}）新，先升级 scene-tool.ts`,
+    );
+  }
+  return state;
+}
+
 type ApplyOptions = {
   plan: string;
   dryRun: boolean;
-  skipSymlinks: boolean;
   allowUnplanned: boolean;
 };
 
@@ -404,7 +550,6 @@ function cmdApply(root: string, opts: ApplyOptions): number {
   // 藏起一个没有场景能带出它的 skill，等于废掉它。
   const untouched = (plan.unassigned ?? []).map(unassignedName).filter((n) => byName.has(n));
   const declared = new Set([...planned, ...untouched]);
-  const targets = new Set(planned);
 
   const unplanned = [...byName.keys()].filter((n) => !declared.has(n)).sort();
   if (unplanned.length && !opts.allowUnplanned) {
@@ -416,63 +561,93 @@ function cmdApply(root: string, opts: ApplyOptions): number {
     );
   }
 
-  const skipped: string[] = [];
-  if (opts.skipSymlinks) {
-    for (const name of [...targets]) {
-      if (byName.get(name)!.isSymlink) {
-        skipped.push(name);
-        targets.delete(name);
+  const prior = loadState(root);
+  // 上一轮由本工具写进 settings 的条目。再次 apply 时它们是自己的手笔，不是用户的选择。
+  const priorOverridden = new Set(prior?.overridden ?? []);
+  // v1/v2 打在 frontmatter 上的标：迁移时要摘掉，否则模型仍然调不动。
+  const priorMarked = new Set(legacyMarkedByTool((prior as unknown as { marked?: (string | LegacyMark)[] })?.marked ?? []));
+
+  const userSettings = settingsPath(root);
+  const localSettings = localSettingsPath(root);
+  const inUser = readOverrides(userSettings);
+  const inLocal = readOverrides(localSettings);
+
+  const targets: string[] = [];
+  const selfDisabled: string[] = [];
+  const preexisting: PriorOverride[] = [];
+  const toUnmark: string[] = [];
+
+  for (const name of planned) {
+    const skill = byName.get(name)!;
+
+    if (skill.hasField) {
+      if (priorMarked.has(name)) {
+        // 旧机制打的标。摘掉它，改用 settings 的档位，模型才能重新调用。
+        toUnmark.push(name);
+      } else {
+        // skill 自带该字段，那是它自身调用契约的要求。文件与 settings 都不动，
+        // 只把它列进场景清单，并在清单里注明只能由用户手工调用。
+        selfDisabled.push(name);
+        continue;
       }
     }
-    skipped.sort();
-  }
 
-  // 已归集过时先认出哪些标是本工具打的。没有这一步，上一轮自己打的标
-  // 会在这一轮被当成「skill 自带」而跳过，restore 就再也摘不掉它了。
-  const prior = new Set<string>();
-  if (isFile(statePath(root))) {
-    try {
-      const old = JSON.parse(fs.readFileSync(statePath(root), "utf8"));
-      for (const m of old.marked ?? []) prior.add(typeof m === "string" ? m : m.name);
-    } catch (err) {
-      throw new ToolError(
-        `状态文件无法解析: ${statePath(root)}\n  ${(err as Error).message}\n` +
-          `修好它或先 restore，不要在状态不明时重复 apply。`,
-      );
+    // 用户自己设过档位的（含 off、user-invocable-only），保留他的选择不覆盖。
+    if (name in inLocal && !priorOverridden.has(name)) {
+      preexisting.push({ name, value: inLocal[name], source: LOCAL_SETTINGS_FILENAME });
+      continue;
     }
+    if (name in inUser && !priorOverridden.has(name) && inUser[name] !== OVERRIDE_VALUE) {
+      preexisting.push({ name, value: inUser[name], source: SETTINGS_FILENAME });
+      continue;
+    }
+    // settings.local.json 的优先级更高，本工具写进 settings.json 的值会被它盖掉。
+    if (name in inLocal && inLocal[name] !== OVERRIDE_VALUE) {
+      preexisting.push({ name, value: inLocal[name], source: LOCAL_SETTINGS_FILENAME });
+      continue;
+    }
+
+    targets.push(name);
   }
-
-  // 自带该字段的 skill 本就不参与自动路由，归集它没有意义：进场景清单即可，文件不动。
-  const selfDisabled = [...targets]
-    .filter((n) => !prior.has(n) && byName.get(n)!.marked)
-    .sort();
-  for (const n of selfDisabled) targets.delete(n);
-
-  // 提前校验索引落点，避免建完场景才发现无处可写。
-  const index = indexPath(root);
 
   if (opts.dryRun) {
     console.log(`[dry-run] 将建立 ${plan.scenes.length} 个场景入口`);
-    console.log(`[dry-run] 将打标 ${targets.size} 个 skill`);
+    console.log(`[dry-run] 将写入 ${targets.length} 条 ${SETTINGS_KEY}=${OVERRIDE_VALUE} 到 ${userSettings}`);
+    if (toUnmark.length) {
+      console.log(`[dry-run] 将摘掉旧机制打在 frontmatter 上的 ${FIELD} ${toUnmark.length} 个`);
+    }
     if (selfDisabled.length) {
-      console.log(`[dry-run] 自带该字段、只进场景清单不改文件 ${selfDisabled.length} 个`);
+      console.log(`[dry-run] 自带 ${FIELD}、只进场景清单不改任何配置 ${selfDisabled.length} 个`);
+    }
+    if (preexisting.length) {
+      console.log(`[dry-run] 用户已设过档位、保留原值 ${preexisting.length} 个:`);
+      for (const p of preexisting) console.log(`           ${p.name} = ${p.value} (${p.source})`);
     }
     console.log(`[dry-run] 声明不归集、保持原样 ${untouched.length} 个`);
-    if (skipped.length) console.log(`[dry-run] 跳过软链 ${skipped.length} 个`);
     if (unplanned.length) console.log(`[dry-run] 未在方案中、保持原样 ${unplanned.length} 个`);
     return 0;
   }
 
   // --- 写操作从这里开始 ---
+  const lockedNames = new Set(selfDisabled);
+
+  for (const name of toUnmark) {
+    const skill = byName.get(name)!;
+    skill.write(dropField(skill.text));
+  }
+
   const state: State = {
     version: STATE_VERSION,
     applied_at: new Date().toISOString(),
     skills_root: root,
+    settings_path: userSettings,
+    override_value: OVERRIDE_VALUE,
     scenes: [],
-    marked: [],
-    self_disabled: selfDisabled,
+    overridden: [...targets].sort(),
+    self_disabled: selfDisabled.sort(),
+    preexisting_overrides: preexisting,
     untouched,
-    skipped_symlinks: skipped,
+    unmarked_legacy: toUnmark.sort(),
     plan,
   };
 
@@ -480,49 +655,59 @@ function cmdApply(root: string, opts: ApplyOptions): number {
     const dirName = SCENE_PREFIX + scene.slug;
     const sceneDir = path.join(root, dirName);
     fs.mkdirSync(sceneDir, { recursive: true });
-    fs.writeFileSync(path.join(sceneDir, "SKILL.md"), renderScene(scene, byName), "utf8");
+    fs.writeFileSync(
+      path.join(sceneDir, "SKILL.md"),
+      renderScene(scene, byName, lockedNames),
+      "utf8",
+    );
     state.scenes.push(dirName);
   }
 
-  for (const name of [...targets].sort()) {
-    const skill = byName.get(name)!;
-    if (!skill.marked) {
-      try {
-        skill.write(addField(skill.text));
-      } catch (err) {
-        throw new ToolError(`${name}/SKILL.md 打标失败: ${(err as Error).message}`);
-      }
-    }
-    state.marked.push(name);
+  writeOverrides(userSettings, new Map(state.overridden.map((n) => [n, OVERRIDE_VALUE])));
+
+  // 上一轮可能生成过反查索引。name-only 之后反查改用 grep，顺手把旧产物清掉。
+  const staleIndex = legacyIndexPath(root, prior);
+  if (staleIndex && isFile(staleIndex)) {
+    fs.unlinkSync(staleIndex);
+    console.log(`删除旧版本的反查索引: ${staleIndex}`);
   }
 
-  fs.writeFileSync(index, renderIndex(plan), "utf8");
-  state.index = path.relative(root, index);
-  fs.writeFileSync(statePath(root), JSON.stringify(state, null, 2), "utf8");
+  fs.writeFileSync(statePath(root), JSON.stringify(state, null, 2) + "\n", "utf8");
 
   console.log(`建立场景入口 ${state.scenes.length} 个`);
-  console.log(`打标 ${state.marked.length} 个（进场景且原本参与自动路由的）`);
+  console.log(`写入 ${state.overridden.length} 条 ${SETTINGS_KEY}=${OVERRIDE_VALUE}: ${userSettings}`);
+  console.log("这些 skill 的 description 不再进启动清单，清单里只留名字，Skill 工具照常可调。");
+  if (toUnmark.length) {
+    console.log(`摘掉旧机制的 frontmatter ${FIELD} ${toUnmark.length} 个（它会禁掉模型调用）`);
+  }
   if (selfDisabled.length) {
     console.log(
-      `自带该字段、只进场景清单不改文件 ${selfDisabled.length} 个: ${selfDisabled.join(", ")}`,
+      `自带 ${FIELD}、只进场景清单 ${selfDisabled.length} 个: ${selfDisabled.join(", ")}`,
     );
+  }
+  if (preexisting.length) {
+    console.log(`用户已设过档位、保留原值 ${preexisting.length} 个:`);
+    for (const p of preexisting) console.log(`  ${p.name} = ${p.value} (${p.source})`);
   }
   console.log(`声明不归集、保持原样 ${untouched.length} 个`);
-  if (skipped.length) {
-    console.log(
-      `跳过软链 ${skipped.length} 个: ${skipped.slice(0, 5).join(", ")}` +
-        (skipped.length > 5 ? " …" : ""),
-    );
-  }
-  console.log(`索引: ${index}`);
   console.log(`状态: ${statePath(root)}`);
   console.log("改动即时生效，不必重开会话。");
   return 0;
 }
 
-function renderScene(scene: SceneSpec, byName: Map<string, Skill>): string {
+function renderScene(
+  scene: SceneSpec,
+  byName: Map<string, Skill>,
+  locked: Set<string>,
+): string {
   const rows = scene.skills
-    .map((n) => `- **[${n}](../${n}/SKILL.md)**\n  ${fullDescription(byName.get(n)!.description)}`)
+    .map((n) => {
+      const skill = byName.get(n)!;
+      const note = locked.has(n)
+        ? `（frontmatter 自带 ${FIELD}，模型调不动：请用户手工 \`/${skill.declaredName}\`）`
+        : "";
+      return `- **${n}**${note}\n  ${fullDescription(skill.description)}`;
+    })
     .join("\n");
 
   return `---
@@ -534,55 +719,45 @@ description: "${scene.description}"
 
 ## 本场景的 skill
 
+用 Skill 工具按名字调用，和平常调用 skill 没有区别——它们只是 description 不在启动清单里，调用本身不受限制。
+
 ${rows}
 
-按当前这一步的需要读取其中一两个，不要全部读入。
+按当前这一步的需要调用其中一两个，不要全部拉进来。
 
 ## 不在本场景的
 
 需要的能力不在上面的清单里时：
 
-- 只要那一个 skill 的内容，直接 \`Read\` 它的 \`SKILL.md\`，路径是 skills 根目录下的同名目录。
-- 整段工作要转到另一个领域，先读 \`../${SELF_NAME}/${INDEX_FILENAME}\` 查它属于哪个场景，再进那个场景。
+- 只要那一个 skill，直接按名字用 Skill 工具调用，不必管它归在哪个场景。
+- 整段工作要转到另一个领域，按各 \`scene-*\` 的 description 选那个场景进去。要反查某个 skill 归谁管，\`grep -l "<skill-name>" <skills 根目录>/scene-*/SKILL.md\`。
 `;
-}
-
-/** scene 与 skill 的名称对应，不写任何别的东西。 */
-function renderIndex(plan: Plan): string {
-  const lines = ["<!-- 由 scene-tool.ts 生成，勿手改 -->", "# scene -> skills", ""];
-  for (const scene of plan.scenes) {
-    lines.push(`${SCENE_PREFIX}${scene.slug}: ${scene.skills.join(" ")}`);
-  }
-  const unassigned = plan.unassigned ?? [];
-  if (unassigned.length) {
-    lines.push("", `(none): ${unassigned.map(unassignedName).join(" ")}`);
-  }
-  return lines.join("\n") + "\n";
 }
 
 function cmdRestore(root: string): number {
   const sp = statePath(root);
-  if (!isFile(sp)) {
+  const state = loadState(root);
+  if (!state) {
     throw new ToolError(
       `状态文件不存在: ${sp}\n` +
-        `没有它就无法区分哪些 ${FIELD} 是本工具加的、哪些是 skill 自带的，` +
-        `无差别删除会破坏后者的调用契约。\n` +
+        `没有它就无法区分哪些配置是本工具写的、哪些是用户自己设的，` +
+        `无差别删除会一并抹掉用户的选择。\n` +
         `处置见 references/collation.md〈状态文件丢失〉。`,
     );
   }
 
-  const state: State = JSON.parse(fs.readFileSync(sp, "utf8"));
-  if (state.version > STATE_VERSION) {
-    throw new ToolError(
-      `状态文件版本 ${state.version} 比本工具（${STATE_VERSION}）新，先升级 scene-tool.ts`,
-    );
-  }
-
   const byName = new Map(collect(root).map((s) => [s.name, s]));
-  const toUnmark = marksToUnmark(state.marked ?? []);
-  let unmarked = 0;
 
-  for (const name of toUnmark) {
+  // v3：删 settings 里本工具写的条目。
+  const target = state.settings_path ?? settingsPath(root);
+  const dropped = dropOverrides(target, state.overridden ?? []);
+
+  // v1/v2：摘掉打在 frontmatter 上的旧标。
+  const legacyMarks = legacyMarkedByTool(
+    (state as unknown as { marked?: (string | LegacyMark)[] }).marked ?? [],
+  );
+  let unmarked = 0;
+  for (const name of legacyMarks) {
     const skill = byName.get(name);
     if (!skill) {
       console.log(`  跳过 ${name}：目录已不存在`);
@@ -601,28 +776,33 @@ function cmdRestore(root: string): number {
     }
   }
 
-  const index = path.join(root, state.index ?? path.join(SELF_NAME, INDEX_FILENAME));
-  if (isFile(index)) fs.unlinkSync(index);
+  const index = legacyIndexPath(root, state);
+  if (index && isFile(index)) fs.unlinkSync(index);
   fs.unlinkSync(sp);
 
-  console.log(`摘除打标 ${unmarked} 个`);
+  if (dropped) console.log(`删除 ${SETTINGS_KEY} 条目 ${dropped} 个: ${target}`);
+  if (unmarked) console.log(`摘除旧机制的 frontmatter ${FIELD} ${unmarked} 个`);
   if ((state.self_disabled ?? []).length) {
-    console.log(`原样保留自带该字段的 ${state.self_disabled.length} 个`);
+    console.log(`原样保留自带 ${FIELD} 的 ${state.self_disabled.length} 个`);
   }
-  console.log(`删除场景入口 ${removed} 个，索引与状态文件已清除`);
+  if ((state.preexisting_overrides ?? []).length) {
+    console.log(`原样保留用户自设档位 ${state.preexisting_overrides.length} 个`);
+  }
+  console.log(`删除场景入口 ${removed} 个，状态文件已清除`);
   console.log("改动即时生效，不必重开会话。");
   return 0;
 }
 
 function cmdVerify(root: string): number {
   const sp = statePath(root);
-  if (!isFile(sp)) {
+  const state = loadState(root);
+  if (!state) {
     console.log(`未归集（状态文件不存在: ${sp}）`);
     return 0;
   }
 
-  const state: State = JSON.parse(fs.readFileSync(sp, "utf8"));
   const byName = new Map(collect(root).map((s) => [s.name, s]));
+  const overrides = effectiveOverrides(root);
   const problems: string[] = [];
 
   for (const dirName of state.scenes ?? []) {
@@ -631,21 +811,34 @@ function cmdVerify(root: string): number {
     }
   }
 
-  for (const name of markNames(state.marked ?? [])) {
+  for (const name of state.overridden ?? []) {
     const skill = byName.get(name);
-    if (!skill) problems.push(`已记录但目录不存在: ${name}`);
-    else if (!skill.marked) problems.push(`打标丢失（可能被升级覆盖）: ${name}`);
+    if (!skill) {
+      problems.push(`已记录但目录不存在: ${name}`);
+      continue;
+    }
+    const value = overrides[name];
+    if (value !== OVERRIDE_VALUE) {
+      problems.push(
+        `${SETTINGS_KEY} 档位不对: ${name} = ${value ?? "(缺失)"}，应为 ${OVERRIDE_VALUE}`,
+      );
+    }
+    // kit 升级可能把这个字段带回来，它会禁掉模型调用并锁死 name-only 档。
+    if (skill.hasField) {
+      problems.push(`frontmatter 又出现 ${FIELD}（可能被升级带回）: ${name}`);
+    }
   }
 
   // untouched 与 self_disabled 是「已知且刻意不动」的，不能被当成漏网的新 skill。
   const tracked = new Set<string>([
-    ...markNames(state.marked ?? []),
+    ...(state.overridden ?? []),
     ...(state.self_disabled ?? []),
+    ...(state.preexisting_overrides ?? []).map((p) => p.name),
     ...(state.untouched ?? []),
     ...(state.scenes ?? []),
   ]);
   const newcomers = [...byName.values()]
-    .filter((s) => !s.isScene && !tracked.has(s.name) && !s.marked)
+    .filter((s) => !s.isScene && !tracked.has(s.name) && !isQuiet(s, overrides))
     .map((s) => s.name)
     .sort();
   if (newcomers.length) {
@@ -679,7 +872,6 @@ const USAGE = `用法: node scene-tool.ts <命令> [选项]
   --skills-root <d>   skills 根目录（默认 ~/.claude/skills）
   --json              scan 输出 JSON
   --dry-run           apply 只预览，不写任何文件
-  --skip-symlinks     apply 不打标软链 skill，避免波及共用该目录的其他工具
   --allow-unplanned   apply 允许方案未覆盖的 skill 保持现状
 `;
 
@@ -694,7 +886,6 @@ function main(): number {
         plan: { type: "string" },
         json: { type: "boolean" },
         "dry-run": { type: "boolean" },
-        "skip-symlinks": { type: "boolean" },
         "allow-unplanned": { type: "boolean" },
         help: { type: "boolean", short: "h" },
       },
@@ -720,7 +911,6 @@ function main(): number {
       return cmdApply(root, {
         plan: values.plan as string,
         dryRun: Boolean(values["dry-run"]),
-        skipSymlinks: Boolean(values["skip-symlinks"]),
         allowUnplanned: Boolean(values["allow-unplanned"]),
       });
     case "restore":

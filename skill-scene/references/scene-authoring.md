@@ -26,11 +26,11 @@
 
 ## 三、不归集的 skill
 
-**不归集意味着完全不动它：不打标，文件一个字不改，照常参与自动路由。**
+**不归集意味着完全不动它：不设档位，照常带着 description 参与自动路由。**
 
-这条没有例外。打标让 skill 退出自动路由，而它能被重新找回来的唯一途径就是某个场景的清单。两者必须绑定：打了标又不进场景的 skill，模型既看不见它、也没有任何入口能带出它，等于被废掉。
+这条没有例外。设了档位的 skill 在清单里只剩名字，模型认出它能干什么的唯一途径就是某个场景的清单。两者必须绑定：设了档位又不进场景的 skill，模型虽然还调得动它，却没有任何入口告诉自己何时该调——等于被废掉。
 
-所以 `unassigned` 只放**真的无处可归**的：跨领域的通用小工具、runtime 专用的、触发条件完全由用户掌握的。它们继续占注入预算，这是让它们保持可用的代价。
+所以 `unassigned` 只放**真的无处可归**的：跨领域的通用小工具、runtime 专用的、触发条件完全由用户掌握的。它们继续占注入预算，这是让它们保持可被自动路由的代价。
 
 反过来说，**能归类的就要归类，哪怕你不打算用它**。同职责落选的那套（上一节）属于能归类，把它放进对应场景即可：清单里它和胜出的那套并列，Agent 读完两边的 description 自己判断该用哪个，而注入预算实实在在省了下来。纯占位壳（description 写的是"仅当显式指定时使用，请改用 X"）也同理，它们有明确的领域归属。
 
@@ -61,7 +61,7 @@
 - `description` 是这个场景实际注入的文本，写法见下一节。
 - `skills` 用 skills 目录下的目录名，不是 frontmatter 里的 `name`（两者可能不一致，例如目录叫 `ak-seo` 而 name 是 `ak:seo`）。
 - `unassigned` 每项必须写 `reason`。没有理由的排除，日后没人敢动。这些 skill 不会被修改，只是登记在案，免得 `verify` 每次都把它们报成漏网的新 skill。
-- 自带 `disable-model-invocation: true` 的 skill 放进 `skills` 没问题：它本就不参与自动路由，脚本只把它列进场景清单，文件不动。
+- 自带 `disable-model-invocation: true` 的 skill 放进 `skills` 没问题：它本就不参与自动路由，脚本只把它列进场景清单、不设档位，并在清单里注明只能由用户手工调用。
 
 ## 五、场景 description 怎么写
 
@@ -76,7 +76,7 @@
 
 ## 六、场景 `SKILL.md` 模板
 
-场景目录里**只有这一个文件**。清单用相对链接指向原件，不要复制、不要做软链。
+场景目录里**只有这一个文件**。清单写 skill 名与它的完整 description，不复制正文、不做软链、也不用链接指向原件——场景内的 skill 都还在启动清单里（只是没有 description），名字就是调用所需的全部。
 
 ```markdown
 ---
@@ -90,22 +90,26 @@ description: "<按上一节写>"
 
 ## 本场景的 skill
 
-- **[dw-workflow](../dw-workflow/SKILL.md)**
+用 Skill 工具按名字调用，和平常调用 skill 没有区别——它们只是 description 不在启动清单里，调用本身不受限制。
+
+- **dw-workflow**
   <原 skill 的完整 description，压平换行后照搬>
-- **[dw-worktree](../dw-worktree/SKILL.md)**
+- **ak-ask**（frontmatter 自带 disable-model-invocation，模型调不动：请用户手工 `/ak:ask`）
   <同上>
 
-按当前这一步的需要读取其中一两个，不要全部读入。
+按当前这一步的需要调用其中一两个，不要全部拉进来。
 
 ## 不在本场景的
 
 需要的能力不在上面的清单里时：
 
-- 只要那一个 skill 的内容，直接 `Read ~/.claude/skills/<skill-name>/SKILL.md`。
-- 整段工作要转到另一个领域，先读 `../skill-scene/SCENE-INDEX.md` 查它属于哪个场景，再进那个场景。
+- 只要那一个 skill，直接按名字用 Skill 工具调用，不必管它归在哪个场景。
+- 整段工作要转到另一个领域，按各 `scene-*` 的 description 选那个场景进去。要反查某个 skill 归谁管，`grep -l "<skill-name>" <skills 根目录>/scene-*/SKILL.md`。
 ```
 
-清单**照搬 skill 的完整 description，不要截断**。场景正文不进启动上下文，进入场景后才加载，在这里省字数省不到任何地方，却会让「该读哪个 skill」失去判据。
+清单**照搬 skill 的完整 description，不要截断**。场景正文不进启动上下文，进入场景后才加载，在这里省字数省不到任何地方，却会让「该调哪个 skill」失去判据。
+
+自带 `disable-model-invocation` 的那几个要带上注解并给出斜杠名（取自它 frontmatter 的 `name`，可能与目录名不同）。没有这句注解，Agent 会去调用、撞上报错，而那条报错还会劝它别找替代路径。
 
 用列表而不是表格：description 里只要出现一个 `|`，表格就会被撑坏。
 
