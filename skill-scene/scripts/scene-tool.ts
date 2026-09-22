@@ -237,7 +237,21 @@ function approxTokens(chars: number): number {
 
 /** 从 description 取第一句作为场景表格里的用途说明。 */
 function firstClause(description: string): string {
-  return description.split("。")[0].split(". ")[0].slice(0, 60);
+  const first = description.split("。")[0].split(". ")[0].trim();
+  if (first.length <= 60) return first;
+  // 中文第一句常常很长，硬切会断在词中间；退到最后一个标点处断开。
+  const head = first.slice(0, 60);
+  const cut = Math.max(head.lastIndexOf("、"), head.lastIndexOf("，"), head.lastIndexOf(" "));
+  return (cut > 20 ? head.slice(0, cut) : head) + "…";
+}
+
+/** 本 skill 自己不参与归集，但它的 description 照常注入，统计时不能漏。 */
+function selfInjection(skillsRoot: string): { count: number; chars: number } {
+  const dir = path.join(skillsRoot, SELF_NAME);
+  if (!isFile(path.join(dir, "SKILL.md"))) return { count: 0, chars: 0 };
+  const self = new Skill(dir);
+  if (self.marked) return { count: 0, chars: 0 };
+  return { count: 1, chars: SELF_NAME.length + self.description.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -252,8 +266,11 @@ function cmdScan(root: string, asJson: boolean): number {
   const unmarked = plain.filter((s) => !s.marked);
   const symlinked = unmarked.filter((s) => s.isSymlink);
 
+  const self = selfInjection(root);
   const injected = [...scenes, ...unmarked];
-  const chars = injected.reduce((sum, s) => sum + s.name.length + s.description.length, 0);
+  const injectedCount = injected.length + self.count;
+  const chars =
+    injected.reduce((sum, s) => sum + s.name.length + s.description.length, 0) + self.chars;
 
   if (asJson) {
     console.log(
@@ -264,7 +281,7 @@ function cmdScan(root: string, asJson: boolean): number {
           marked: marked.map((s) => s.name),
           unmarked: unmarked.map((s) => s.name),
           symlinked_unmarked: symlinked.map((s) => s.name),
-          injected_count: injected.length,
+          injected_count: injectedCount,
           injected_chars: chars,
           injected_tokens_approx: approxTokens(chars),
         },
@@ -281,7 +298,7 @@ function cmdScan(root: string, asJson: boolean): number {
   console.log(`  仍在注入     : ${unmarked.length}`);
   console.log();
   console.log(
-    `当前启动注入 ${injected.length} 份 description，约 ${chars} 字符 / ${approxTokens(chars)} tokens`,
+    `当前启动注入 ${injectedCount} 份 description，约 ${chars} 字符 / ${approxTokens(chars)} tokens`,
   );
 
   if (symlinked.length) {
