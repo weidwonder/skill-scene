@@ -31,6 +31,11 @@ const SELF_NAME = "skill-scene";
 const SCENE_PREFIX = "scene-";
 const STATE_VERSION = 3;
 
+/** 常驻（不在任何场景里、仍带 description 进启动清单）的 skill 上限。这是用户定下的
+ *  注入预算，不是归类判据：超出时先设法归集，归不进去再交给用户决定，用户同意常驻的
+ *  逐个写进方案的 residue_waiver.skills。 */
+const RESIDUE_CAP = 15;
+
 /** 这些目录不是普通 skill，归集时一律跳过。
  *  synced 由 claude.ai 同步机制管理，带自己的 manifest，改动会被覆盖。 */
 const RESERVED = new Set([SELF_NAME, "synced"]);
@@ -47,7 +52,12 @@ type UnassignedSpec = { name: string; reason?: string } | string;
 type Plan = {
   scenes: SceneSpec[];
   unassigned?: UnassignedSpec[];
+  /** 常驻数超过 RESIDUE_CAP 时，用户同意照常常驻的 skill 与理由。
+   *  只豁免点了名的这些，之后新增的常驻必须重新问用户。 */
+  residue_waiver?: ResidueWaiver;
 };
+
+type ResidueWaiver = { reason: string; skills: string[] };
 
 /** 用户自己设过的 override：保留原值，记录来源文件。 */
 type PriorOverride = { name: string; value: string; source: string };
@@ -359,6 +369,50 @@ function isQuiet(skill: Skill, overrides: Record<string, string>): boolean {
   return (value !== undefined && value !== "on") || skill.hasField;
 }
 
+/** 常驻：不在任何场景里、description 仍在启动清单里的 skill。
+ *  设了 off/user-invocable-only 或自带 FIELD 的不注入，不计入；本 skill 与 synced
+ *  不在 collect 的结果里，场景入口由 isScene 排除，插件 skill 本就不在 skills 目录下。 */
+function residueOf(
+  skills: Skill[],
+  overrides: Record<string, string>,
+  sceneMembers: Set<string>,
+): string[] {
+  return skills
+    .filter((s) => !s.isScene && !sceneMembers.has(s.name) && !isQuiet(s, overrides))
+    .map((s) => s.name)
+    .sort();
+}
+
+function sceneMembersOf(plan: Plan | undefined): Set<string> {
+  return new Set((plan?.scenes ?? []).flatMap((s) => s.skills));
+}
+
+/** 常驻超限、且有未经用户同意的常驻时返回它们；不需要处置时返回空数组。 */
+function unwaivedResidue(residue: string[], waiver: ResidueWaiver | undefined): string[] {
+  if (residue.length <= RESIDUE_CAP) return [];
+  const waived = new Set(waiver?.skills ?? []);
+  return residue.filter((n) => !waived.has(n));
+}
+
+/** 常驻超限时给 Agent 的处置指引。source 标出每个名字为什么常驻，便于逐个判断。 */
+function residueGuidance(
+  residue: string[],
+  unwaived: string[],
+  source: (name: string) => string,
+): string {
+  const waived = residue.filter((n) => !unwaived.includes(n));
+  return (
+    `常驻（不在任何场景里、仍带 description 注入）的 skill 有 ${residue.length} 个，` +
+    `超过上限 ${RESIDUE_CAP}。其中未经用户同意常驻的 ${unwaived.length} 个:\n  ` +
+    unwaived.map((n) => `${n}（${source(n)}）`).join("\n  ") +
+    (waived.length ? `\n已由 residue_waiver 同意常驻的 ${waived.length} 个: ${waived.join(", ")}` : "") +
+    "\n处置（见 references/scene-authoring.md〈常驻上限〉）：先设法把上面这些归进已有场景，" +
+    "或为其中服务同一类任务的几个新开一个有独立进入条件的场景；仍归不进去的交给用户决定——" +
+    "给出新的归集方式，或同意它们常驻。用户同意的，把名字加进方案的 residue_waiver.skills" +
+    "（reason 写用户的理由），然后重新 apply。不要在用户同意之前自己加。"
+  );
+}
+
 /** 场景正文里照搬 skill 的完整 description。
  *
  *  场景正文不进启动上下文，进入场景后才加载，所以这里省字数省不到任何地方，
@@ -393,6 +447,10 @@ function cmdScan(root: string, asJson: boolean): number {
   const legacy = plain.filter((s) => s.hasField);
 
   const self = selfInjection(root, overrides);
+  // 常驻上限约束的是归集之后留下的部分。还没归集过时不算常驻，也不报上限，
+  // 免得把数量误当成「该发起归集」的理由。
+  const state = loadState(root);
+  const residue = state ? residueOf(skills, overrides, sceneMembersOf(state.plan)) : null;
   const injected = [...scenes, ...loud];
   const injectedCount = injected.length + self.count;
   const chars =
@@ -418,6 +476,8 @@ function cmdScan(root: string, asJson: boolean): number {
           name_only_count: nameOnly.length,
           name_only_chars: nameOnlyChars,
           name_only_tokens_approx: approxTokens(nameOnlyChars),
+          residue,
+          residue_cap: RESIDUE_CAP,
         },
         null,
         2,
@@ -431,6 +491,7 @@ function cmdScan(root: string, asJson: boolean): number {
   console.log(`  场景入口     : ${scenes.length}`);
   console.log(`  已退出注入   : ${quiet.length}`);
   console.log(`  仍在注入     : ${loud.length}`);
+  if (residue) console.log(`  其中常驻     : ${residue.length}（上限 ${RESIDUE_CAP}）`);
   console.log();
   console.log(
     `当前启动注入 ${injectedCount} 份 description，约 ${chars} 字符 / ${approxTokens(chars)} tokens`,
@@ -454,8 +515,12 @@ function cmdScan(root: string, asJson: boolean): number {
     if (legacy.length > 10) console.log(`  … 另有 ${legacy.length - 10} 个`);
   }
 
-  // 只报事实，不替使用者下「该归集了」的判断：该不该做取决于这份清单是否
-  // 已经在妨碍路由，不取决于任何一个数量阈值。
+  if (residue && residue.length > RESIDUE_CAP) {
+    console.log();
+    console.log(`常驻超过上限 ${RESIDUE_CAP}，运行 verify 查看哪些未经用户同意、以及怎么处置。`);
+  }
+
+  // 该不该发起归集取决于这份清单是否已经在妨碍路由，不取决于数量，所以这里只报事实。
   return 0;
 }
 
@@ -496,6 +561,24 @@ function loadPlan(planPath: string): Plan {
         );
       }
       owner.set(name, scene.slug);
+    }
+  }
+
+  const w = plan.residue_waiver as unknown;
+  if (w !== undefined) {
+    const ok =
+      w !== null &&
+      typeof w === "object" &&
+      typeof (w as ResidueWaiver).reason === "string" &&
+      (w as ResidueWaiver).reason.trim() !== "" &&
+      Array.isArray((w as ResidueWaiver).skills) &&
+      (w as ResidueWaiver).skills.length > 0 &&
+      (w as ResidueWaiver).skills.every((n) => typeof n === "string" && n);
+    if (!ok) {
+      throw new ToolError(
+        'residue_waiver 格式应为 {"reason": "<用户的理由>", "skills": ["<用户同意常驻的 skill>", …]}，' +
+          "reason 与 skills 都不能为空。它只在用户明确同意某些 skill 常驻后才写。",
+      );
     }
   }
   return plan;
@@ -592,27 +675,63 @@ function cmdApply(root: string, opts: ApplyOptions): number {
       }
     }
 
-    // 用户自己设过档位的（含 off、user-invocable-only），保留他的选择不覆盖。
-    if (name in inLocal && !priorOverridden.has(name)) {
+    // 用户自己设过档位的（含 off、user-invocable-only），保留用户的选择不覆盖。
+    // settings.local.json 本工具从不写，里面的条目都是用户的；它优先级更高，
+    // 写进 settings.json 的值反正也会被它盖掉。
+    if (name in inLocal) {
       preexisting.push({ name, value: inLocal[name], source: LOCAL_SETTINGS_FILENAME });
       continue;
     }
-    if (name in inUser && !priorOverridden.has(name) && inUser[name] !== OVERRIDE_VALUE) {
+    // settings.json 里不是 name-only 的值不是本工具写的——包括上一轮本工具写过、
+    // 之后被用户改掉的，那也是用户的选择。
+    if (name in inUser && inUser[name] !== OVERRIDE_VALUE) {
       preexisting.push({ name, value: inUser[name], source: SETTINGS_FILENAME });
-      continue;
-    }
-    // settings.local.json 的优先级更高，本工具写进 settings.json 的值会被它盖掉。
-    if (name in inLocal && inLocal[name] !== OVERRIDE_VALUE) {
-      preexisting.push({ name, value: inLocal[name], source: LOCAL_SETTINGS_FILENAME });
       continue;
     }
 
     targets.push(name);
   }
 
+  // 上一轮由本工具设了档位、这一轮不再归进场景的：没有场景能带出它，必须摘掉档位、
+  // 让 description 回到启动清单，否则它等于被废掉，restore 也再找不到这条记录。
+  // 只删值仍是 name-only 的：被用户改成别的值的，是用户的选择，原样保留。
+  const targetSet = new Set(targets);
+  const stale = [...priorOverridden]
+    .filter((n) => !targetSet.has(n) && inUser[n] === OVERRIDE_VALUE)
+    .sort();
+
+  // 声明不归集的与未在方案里的都照常常驻，一起计入上限。按本次写入之后的档位计算。
+  const userAfter = { ...inUser };
+  for (const name of stale) delete userAfter[name];
+  for (const name of targets) userAfter[name] = OVERRIDE_VALUE;
+  const residue = residueOf([...byName.values()], { ...userAfter, ...inLocal }, new Set(planned));
+  const unwaived = unwaivedResidue(residue, plan.residue_waiver);
+  const untouchedSet = new Set(untouched);
+  const guidance = unwaived.length
+    ? residueGuidance(residue, unwaived, (n) =>
+        untouchedSet.has(n) ? "写在 unassigned" : "未在方案中，--allow-unplanned 放过",
+      )
+    : "";
+  // 真正执行时在任何写操作之前拒绝；dry-run 先把完整预览打出来再报，
+  // 这样给用户看的写入面是全的。
+  if (guidance && !opts.dryRun) throw new ToolError(guidance);
+
+  // 上一轮建过、这一轮方案里已没有的场景入口。只删状态文件记录在案的，
+  // 用户自己建的 scene-* 目录不归本工具管。新状态不再记录它们，现在不删就永远删不掉了。
+  const planDirs = new Set(plan.scenes.map((s) => SCENE_PREFIX + s.slug));
+  const staleScenes = (prior?.scenes ?? [])
+    .filter((d) => !planDirs.has(d) && isDir(path.join(root, d)))
+    .sort();
+
   if (opts.dryRun) {
     console.log(`[dry-run] 将建立 ${plan.scenes.length} 个场景入口`);
     console.log(`[dry-run] 将写入 ${targets.length} 条 ${SETTINGS_KEY}=${OVERRIDE_VALUE} 到 ${userSettings}`);
+    if (stale.length) {
+      console.log(`[dry-run] 将删掉上一轮写入、这一轮已不在场景里的档位 ${stale.length} 个: ${stale.join(", ")}`);
+    }
+    if (staleScenes.length) {
+      console.log(`[dry-run] 将删除方案里已没有的场景入口 ${staleScenes.length} 个: ${staleScenes.join(", ")}`);
+    }
     if (toUnmark.length) {
       console.log(`[dry-run] 将摘掉旧机制打在 frontmatter 上的 ${FIELD} ${toUnmark.length} 个`);
     }
@@ -625,6 +744,11 @@ function cmdApply(root: string, opts: ApplyOptions): number {
     }
     console.log(`[dry-run] 声明不归集、保持原样 ${untouched.length} 个`);
     if (unplanned.length) console.log(`[dry-run] 未在方案中、保持原样 ${unplanned.length} 个`);
+    console.log(`[dry-run] ${residueSummary(residue, plan.residue_waiver)}`);
+    if (guidance) {
+      console.error(`\n错误: ${guidance}`);
+      return 1;
+    }
     return 0;
   }
 
@@ -663,6 +787,11 @@ function cmdApply(root: string, opts: ApplyOptions): number {
     state.scenes.push(dirName);
   }
 
+  for (const dirName of staleScenes) {
+    fs.rmSync(path.join(root, dirName), { recursive: true, force: true });
+  }
+
+  if (stale.length) dropOverrides(userSettings, stale);
   writeOverrides(userSettings, new Map(state.overridden.map((n) => [n, OVERRIDE_VALUE])));
 
   // 上一轮可能生成过反查索引。name-only 之后反查改用 grep，顺手把旧产物清掉。
@@ -677,6 +806,12 @@ function cmdApply(root: string, opts: ApplyOptions): number {
   console.log(`建立场景入口 ${state.scenes.length} 个`);
   console.log(`写入 ${state.overridden.length} 条 ${SETTINGS_KEY}=${OVERRIDE_VALUE}: ${userSettings}`);
   console.log("这些 skill 的 description 不再进启动清单，清单里只留名字，Skill 工具照常可调。");
+  if (stale.length) {
+    console.log(`删掉已移出场景的档位 ${stale.length} 个，它们的 description 回到启动清单: ${stale.join(", ")}`);
+  }
+  if (staleScenes.length) {
+    console.log(`删除方案里已没有的场景入口 ${staleScenes.length} 个: ${staleScenes.join(", ")}`);
+  }
   if (toUnmark.length) {
     console.log(`摘掉旧机制的 frontmatter ${FIELD} ${toUnmark.length} 个（它会禁掉模型调用）`);
   }
@@ -690,9 +825,17 @@ function cmdApply(root: string, opts: ApplyOptions): number {
     for (const p of preexisting) console.log(`  ${p.name} = ${p.value} (${p.source})`);
   }
   console.log(`声明不归集、保持原样 ${untouched.length} 个`);
+  console.log(residueSummary(residue, plan.residue_waiver));
   console.log(`状态: ${statePath(root)}`);
   console.log("改动即时生效，不必重开会话。");
   return 0;
+}
+
+function residueSummary(residue: string[], waiver: ResidueWaiver | undefined): string {
+  const line = `常驻 ${residue.length} 个（上限 ${RESIDUE_CAP}）`;
+  if (residue.length <= RESIDUE_CAP || !waiver) return line;
+  const waived = residue.filter((n) => waiver.skills.includes(n));
+  return `${line}，经用户同意常驻 ${waived.length} 个: ${waived.join(", ")}；理由: ${waiver.reason}`;
 }
 
 function renderScene(
@@ -748,9 +891,14 @@ function cmdRestore(root: string): number {
 
   const byName = new Map(collect(root).map((s) => [s.name, s]));
 
-  // v3：删 settings 里本工具写的条目。
+  // v3：删 settings 里本工具写的条目。值已被用户改掉的是用户的选择，原样保留。
   const target = state.settings_path ?? settingsPath(root);
-  const dropped = dropOverrides(target, state.overridden ?? []);
+  const current = readOverrides(target);
+  const ours = (state.overridden ?? []).filter((n) => current[n] === OVERRIDE_VALUE);
+  const changed = (state.overridden ?? []).filter(
+    (n) => n in current && current[n] !== OVERRIDE_VALUE,
+  );
+  const dropped = dropOverrides(target, ours);
 
   // v1/v2：摘掉打在 frontmatter 上的旧标。
   const legacyMarks = legacyMarkedByTool(
@@ -781,6 +929,9 @@ function cmdRestore(root: string): number {
   fs.unlinkSync(sp);
 
   if (dropped) console.log(`删除 ${SETTINGS_KEY} 条目 ${dropped} 个: ${target}`);
+  if (changed.length) {
+    console.log(`原样保留已被用户改成别的档位的 ${changed.length} 个: ${changed.join(", ")}`);
+  }
   if (unmarked) console.log(`摘除旧机制的 frontmatter ${FIELD} ${unmarked} 个`);
   if ((state.self_disabled ?? []).length) {
     console.log(`原样保留自带 ${FIELD} 的 ${state.self_disabled.length} 个`);
@@ -849,6 +1000,17 @@ function cmdVerify(root: string): number {
     );
   }
 
+  // residue_waiver 只豁免用户点过名的那些，之后多出来的常驻仍要按上限处置。
+  const residue = residueOf([...byName.values()], overrides, sceneMembersOf(state.plan));
+  const unwaived = unwaivedResidue(residue, state.plan?.residue_waiver);
+  if (unwaived.length) {
+    const untouchedSet = new Set(state.untouched ?? []);
+    const guidance = residueGuidance(residue, unwaived, (n) =>
+      untouchedSet.has(n) ? "写在 unassigned" : "新装或未在方案中",
+    );
+    problems.push(guidance.replace(/\n/g, "\n    "));
+  }
+
   if (problems.length === 0) {
     console.log("一致。");
     return 0;
@@ -866,7 +1028,7 @@ const USAGE = `用法: node scene-tool.ts <命令> [选项]
   scan                盘点现状与注入体积
   apply --plan <f>    按方案执行归集
   restore             按状态文件还原
-  verify              校验归集状态一致性
+  verify              校验归集状态一致性与常驻上限
 
 选项:
   --skills-root <d>   skills 根目录（默认 ~/.claude/skills）

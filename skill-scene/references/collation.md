@@ -24,15 +24,18 @@ node scene-tool.ts scan
 
 方案里每个 skill 只能有一个主场景。同一个 skill 出现在两个场景里，脚本会拒绝执行——跨场景使用直接按名字调用，不靠重复登记。
 
+常驻上限与超限时的处置见 [scene-authoring.md](scene-authoring.md)〈常驻上限〉。
+
 ### 第 3 步：用户确认
 
 **这一步不能跳过，也不能用"我先做了你再看"代替。**
 
-拿给用户确认三件事：
+拿给用户确认四件事：
 
 1. **场景划分**：几个场景、各自收了哪些 skill。
 2. **取舍结果**：哪些 skill 被判为同职责而落选，理由是什么。
-3. **写入面**：会新建 `scene-*` 目录、在 `settings.json` 里加 `skillOverrides` 条目、写状态文件。skill 文件本身不动（唯一例外是摘掉旧版本机制留下的 `disable-model-invocation`，`dry-run` 会报出个数）。
+3. **常驻名单**：哪些 skill 常驻、各自为什么归不进场景，总数是否超过上限（以 dry-run 报出的为准）。超限时这里就是请用户决定的地方，用户同意常驻的写进 `residue_waiver.skills` 再执行。
+4. **写入面**：会新建 `scene-*` 目录、在 `settings.json` 里加 `skillOverrides` 条目、写状态文件。skill 文件本身不动（唯一例外是摘掉旧版本机制留下的 `disable-model-invocation`，`dry-run` 会报出个数）。
 
 先 dry-run 给用户看规模：
 
@@ -46,9 +49,15 @@ node scene-tool.ts apply --plan scenes.json --dry-run
 node scene-tool.ts apply --plan scenes.json
 ```
 
-可选参数 `--allow-unplanned`：允许方案未覆盖的 skill 保持现状。默认情况下有遗漏就停下报错，避免静默漏掉。
+可选参数 `--allow-unplanned`：允许方案未覆盖的 skill 保持现状。默认情况下有遗漏就停下报错，避免静默漏掉。放过去的这些同样算常驻。
 
-执行完把结果报给用户：建了几个场景、写了几条档位、保留了哪些原值、索引和状态文件在哪。**改动即时生效，不必重开会话**，可以当场验证。
+常驻超过上限、且其中有不在 `residue_waiver.skills` 里的 skill 时，`apply` 在写任何东西之前拒绝执行，并列出这些名字及各自的来源。`--dry-run` 会先打出完整预览，再报同样的错，以非零状态退出。
+
+再次 `apply` 时，上一轮归进场景、这一轮移到 `unassigned` 或移出方案的 skill，会被删掉 `name-only` 档位，description 回到启动清单——没有场景能带出它，就不能让它只剩名字。只删值仍是 `name-only` 的；之后被用户改成别的值的，视为用户的选择，原样保留。
+
+同理，上一轮建过、这一轮方案里已没有的场景入口目录会被删除。只删状态文件记录在案的那些，用户自己建的 `scene-*` 目录不碰。
+
+执行完把结果报给用户：建了几个场景、写了几条档位、删了哪些过期档位与旧场景入口、保留了哪些原值、常驻几个（其中经用户同意常驻的是哪些）、状态文件在哪。**改动即时生效，不必重开会话**，可以当场验证。
 
 ### 档位的语义
 
@@ -101,7 +110,7 @@ v1（`marked` 是 `{name, had_field}` 数组）与 v2（`marked` 是字符串数
 node scene-tool.ts restore
 ```
 
-它做三件事：从 `settings.json` 删掉 `overridden` 名单里的条目（删空后连 `skillOverrides` 键一起移除）、删除所有场景入口目录、删除状态文件。旧版本生成过 `SCENE-INDEX.md` 反查索引，状态文件里记着它时一并删掉。遇到 v1/v2 状态文件时额外摘掉当年打在 frontmatter 上的标。`self_disabled`、`preexisting_overrides`、`untouched` 三份名单从头到尾没被改过，还原时自然也不碰。
+它做三件事：从 `settings.json` 删掉 `overridden` 名单里值仍是 `name-only` 的条目（删空后连 `skillOverrides` 键一起移除；已被用户改成别的值的原样保留）、删除所有场景入口目录、删除状态文件。旧版本生成过 `SCENE-INDEX.md` 反查索引，状态文件里记着它时一并删掉。遇到 v1/v2 状态文件时额外摘掉当年打在 frontmatter 上的标。`self_disabled`、`preexisting_overrides`、`untouched` 三份名单从头到尾没被改过，还原时自然也不碰。
 
 ## 四、故障处置
 
@@ -130,15 +139,15 @@ node scene-tool.ts restore
 node scene-tool.ts verify
 ```
 
-它逐条比对 `overridden` 名单的生效档位，报出缺失或值不对的条目。重新 `apply` 即可补回，该命令对已设好的条目是幂等的。
+它逐条比对 `overridden` 名单的生效档位，报出缺失或值不对的条目。缺失的，重新 `apply` 即可补回，该命令对已设好的条目是幂等的。值被改成别的，视为用户的选择：重新 `apply` 会把它转进 `preexisting_overrides` 保留，不会改回去。
 
 注意 `settings.local.json` 的优先级高于 `settings.json`：本地文件里给同一个 skill 设了别的档位时，写进 `settings.json` 的值不会生效。`apply` 会把这种情况记进 `preexisting_overrides` 并跳过，不去覆盖。
 
 ### 装了新 skill
 
-`verify` 会把未归集的新 skill 列出来。处置是把它们加进 `scenes.json` 的对应场景或 `unassigned`，重新 `apply`。
+用户说装了新 skill、或 `scan` 报出常驻超过上限时，跑 `verify`。它会把未归集的新 skill 列出来。处置是把它们加进 `scenes.json` 的对应场景或 `unassigned`，重新 `apply`。
 
-新 skill 在被归集之前照常参与自动路由，不会失效，所以这件事不紧急，可以攒一批再做。
+新 skill 在被归集之前照常参与自动路由，不会失效，所以这件事不紧急，可以攒一批再做。但它们算常驻：常驻因此超过上限时，`verify` 会单独列出未经用户同意常驻的那些——`residue_waiver.skills` 里没有的都算，新增的自然不在其中——按 [scene-authoring.md](scene-authoring.md)〈常驻上限〉的顺序处置。
 
 ### 场景入口被误删
 

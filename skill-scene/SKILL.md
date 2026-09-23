@@ -17,7 +17,7 @@ description: "把过多的 skill 按场景归集：少数场景入口参与模�
 |---------|--------|-----------|
 | 机制约束、四条硬事实 | 本文件〈机制约束〉 | 触发即读 |
 | 日常在场景里找 skill、跨场景引用 | 本文件 A 节 | 触发即读 |
-| 场景怎么划、scene SKILL.md 怎么写 | [references/scene-authoring.md](references/scene-authoring.md) | 仅当要生成或调整场景划分时 |
+| 场景怎么划、常驻上限的处置、scene SKILL.md 怎么写 | [references/scene-authoring.md](references/scene-authoring.md) | 仅当要生成或调整场景划分时 |
 | 归集/还原的执行步骤与脚本用法 | [references/collation.md](references/collation.md) | 仅当要执行归集、还原或排查归集故障时 |
 
 ## 机制约束
@@ -91,6 +91,8 @@ node <skill 根目录>/scripts/scene-tool.ts scan
 
 用户主动说"skill 太多""上下文被吃满""整理一下技能"时，直接进入 C 节，不必再提议。
 
+已经归集过的环境里，用户说装了新 skill、或 `scan` 报出常驻超过上限时，跑一次 `scene-tool.ts verify`。它会列出还没归集的新 skill 和未经用户同意的常驻，报错里写着处置方法；照着补进方案，重新走 C 节的第 3、4 步。
+
 ## C. 执行归集
 
 **归集会新建场景目录并改写 `settings.json`，必须用户确认方案后才执行。** 完整步骤、脚本参数与故障处置在 [references/collation.md](references/collation.md)，开始执行前读它。
@@ -98,8 +100,8 @@ node <skill 根目录>/scripts/scene-tool.ts scan
 骨架是四步：
 
 1. `scene-tool.ts scan` 盘点现状。
-2. 按 [references/scene-authoring.md](references/scene-authoring.md) 的方法做归类，产出 `scenes.json`。
-3. 把归类方案给用户看，逐项确认。**用户没确认之前不执行任何写操作。**
+2. 按 [references/scene-authoring.md](references/scene-authoring.md) 的方法做归类，产出 `scenes.json`。**常驻**（不在任何场景里、仍带 description 进启动清单的）最多 15 个，超出时先设法归集，见该文件〈常驻上限〉。
+3. 把归类方案给用户看，逐项确认，包括常驻名单。常驻仍超上限时，由用户决定是换一种归集方式，还是同意它们常驻。**用户没确认之前不执行任何写操作。**
 4. `scene-tool.ts apply --plan scenes.json` 执行，然后把结果报给用户。
 
 ## D. 还原
@@ -110,7 +112,7 @@ node <skill 根目录>/scripts/scene-tool.ts scan
 node <skill 根目录>/scripts/scene-tool.ts restore
 ```
 
-它按状态文件 `~/.claude/.skill-scene-state.json` 回滚：删掉 `scene-*` 目录，并从 `settings.json` 的 `skillOverrides` 里删掉本机制写入的条目。用户自己设过档位的、自带 `disable-model-invocation` 的、以及声明不归集的，从头到尾没被改过，还原时也不碰。
+它按状态文件 `~/.claude/.skill-scene-state.json` 回滚：删掉 `scene-*` 目录，并从 `settings.json` 的 `skillOverrides` 里删掉本机制写入、值仍是 `name-only` 的条目。用户自己设过档位的、自带 `disable-model-invocation` 的、以及声明不归集的，从头到尾没被改过，还原时也不碰。
 
 **状态文件丢失时脚本会报错停下，不要猜着还原。** `skillOverrides` 里可能混着用户自己设的档位（他可能刻意把某个 skill 设成 `off`），无差别清空会把这些选择一起抹掉。处置见 [references/collation.md](references/collation.md)〈状态文件丢失〉。
 

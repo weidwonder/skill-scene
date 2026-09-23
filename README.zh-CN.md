@@ -36,6 +36,8 @@ Claude Code 在会话启动时，会把 `~/.claude/skills/` 下每个 skill 的 
 
 场景目录里只有一个 `SKILL.md`，清单直接写 skill 名与它的完整 description，不复制正文也不做软链——skill 本体始终只有一份，上游升级后不会出现两份漂移。
 
+归不进任何场景的 skill 保持原样、照常带着 description 常驻，但常驻**最多 15 个**。超出时 Agent 先设法归集，归不进去的交给用户决定：给出新的归集方式，或同意它们常驻。用户同意常驻的，逐个写进方案的 `residue_waiver`，连同用户的理由；名单外的常驻一旦超限，`apply` 拒绝执行。
+
 ## 前提
 
 Node 22.18 以上（原生运行 TypeScript，无需编译或安装依赖）。22.6 到 22.17 之间运行脚本时加 `--experimental-strip-types`。
@@ -54,7 +56,7 @@ cd ~/.claude/skills/skill-scene/scripts
 node scene-tool.ts scan                          # 盘点：多少个仍在注入、占多少 token
 node scene-tool.ts apply --plan scenes.json --dry-run
 node scene-tool.ts apply --plan scenes.json      # 执行归集
-node scene-tool.ts verify                        # 校验一致性
+node scene-tool.ts verify                        # 校验一致性与常驻上限
 node scene-tool.ts restore                       # 还原
 ```
 

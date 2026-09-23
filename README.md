@@ -36,6 +36,8 @@ What the model sees is a dozen scene entries with descriptions, plus a list of b
 
 A scene directory holds a single `SKILL.md`, and its list carries each skill's name and full description — no copied body, no symlink. There is always exactly one copy of a skill, so an upstream upgrade cannot leave a stale second version behind.
 
+A skill that fits no scene is left alone and keeps its description in the listing, but **no more than 15 of them** may stay resident. Past that cap the agent first tries to collate them, then hands whatever is left to the user, who either proposes a new way to collate them or decides to keep them resident. The skills the user agrees to keep are listed by name in the plan's `residue_waiver`, together with the user's reason; if anything outside that list pushes the count over the cap, `apply` refuses to run.
+
 ## Requirements
 
 Node 22.18 or newer (runs TypeScript natively, no build step and no dependencies). Between 22.6 and 22.17, pass `--experimental-strip-types` when running the script.
@@ -54,7 +56,7 @@ cd ~/.claude/skills/skill-scene/scripts
 node scene-tool.ts scan                          # inventory: how many still inject, how many tokens
 node scene-tool.ts apply --plan scenes.json --dry-run
 node scene-tool.ts apply --plan scenes.json      # collate
-node scene-tool.ts verify                        # check consistency
+node scene-tool.ts verify                        # check consistency and the resident cap
 node scene-tool.ts restore                       # roll back
 ```
 
